@@ -26,14 +26,14 @@ pipeline {
         stage('Pruebas Unitarias (Tests)') {
             steps {
                 script {
-                    // Esta es la forma limpia:
-                    // Ejecutamos las pruebas DENTRO de un contenedor SDK temporal.
-                    // No necesitamos 'dotnet' instalado en el agente de Jenkins.
                     docker.image(DOTNET_SDK_IMAGE).inside {
-                        // El comando 'inside' monta el workspace actual
-                        sh 'dotnet restore'
-                        // Si tuvieras un proyecto de pruebas, lo correrías aquí:
-                        // sh 'dotnet test --no-restore --logger "trx;LogFileName=testresults.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover'
+                        // --- LA CORRECCIÓN ---
+                        // Le decimos explícitamente qué proyecto restaurar
+                        sh 'dotnet restore NotificationDelivery.csproj'
+                        
+                        // También corregí el ejemplo de 'dotnet test' que tenías comentado,
+                        // por si lo usas en el futuro, para que apunte al proyecto.
+                        // sh 'dotnet test NotificationDelivery.csproj --no-restore --logger "trx;LogFileName=testresults.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover'
                         echo 'Saltando pruebas (puedes configurar tu proyecto de tests aquí)...'
                     }
                 }
