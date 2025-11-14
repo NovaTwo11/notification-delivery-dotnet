@@ -1,84 +1,121 @@
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using System.Text;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Options;
 using Newtonsoft.Json.Linq;
 using NotificationDelivery.Configuration;
-using Microsoft.Extensions.Options;
+using NotificationDelivery.Services;
 
 namespace NotificationDelivery.Services
 {
-    public class RabbitMQService : IRabbitMQService, IDisposable
+    public class RabbitMQService : IRabbitMQService
     {
         private readonly ILogger<RabbitMQService> _logger;
         private readonly RabbitMQSettings _settings;
         private readonly IServiceProvider _serviceProvider;
         private IConnection? _connection;
         private IModel? _channel;
+        private const int MAX_RETRIES = 20;
+        private const int RETRY_DELAY_SECONDS = 3;
 
         public RabbitMQService(
             ILogger<RabbitMQService> logger,
             IOptions<RabbitMQSettings> settings,
             IServiceProvider serviceProvider)
         {
-            _logger = logger;
-            _settings = settings.Value;
-            _serviceProvider = serviceProvider;
-            InitializeRabbitMQ();
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
+            _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
         }
 
         private void InitializeRabbitMQ()
         {
-            var factory = new ConnectionFactory
+            var attempt = 1;
+
+            while (attempt <= MAX_RETRIES)
             {
-                HostName = _settings.Host,
-                Port = _settings.Port,
-                UserName = _settings.Username,
-                Password = _settings.Password,
-                AutomaticRecoveryEnabled = true,
-                NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
-            };
+                try
+                {
+                    _logger.LogInformation($"🔄 Intentando conectar a RabbitMQ (intento {attempt}/{MAX_RETRIES})...");
+                    _logger.LogInformation($"📍 Host: {_settings.Host}:{_settings.Port}");
 
-            _connection = factory.CreateConnection();
-            _channel = _connection.CreateModel();
+                    var factory = new ConnectionFactory
+                    {
+                        HostName = _settings.Host,
+                        Port = _settings.Port,
+                        UserName = _settings.Username,
+                        Password = _settings.Password,
+                        AutomaticRecoveryEnabled = true,
+                        NetworkRecoveryInterval = TimeSpan.FromSeconds(10),
+                        RequestedHeartbeat = TimeSpan.FromSeconds(60)
+                    };
 
-            _channel.QueueDeclare(
-                queue: _settings.QueueName,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: null
-            );
+                    _connection = factory.CreateConnection();
+                    _channel = _connection.CreateModel();
 
-            _logger.LogInformation($"✅ Conectado a RabbitMQ - Cola: {_settings.QueueName}");
+                    // Declarar cola durable
+                    _channel.QueueDeclare(
+                        queue: _settings.QueueName,
+                        durable: true,
+                        exclusive: false,
+                        autoDelete: false,
+                        arguments: null
+                    );
+
+                    _logger.LogInformation("✅ Conexión a RabbitMQ establecida exitosamente");
+                    _logger.LogInformation($"👂 Escuchando en cola: {_settings.QueueName}");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"❌ Error conectando a RabbitMQ (intento {attempt}/{MAX_RETRIES}): {ex.Message}");
+
+                    if (attempt == MAX_RETRIES)
+                    {
+                        _logger.LogCritical("🔥 No se pudo conectar después de múltiples intentos. Abortando.");
+                        throw new Exception($"Failed to connect to RabbitMQ after {MAX_RETRIES} attempts", ex);
+                    }
+
+                    _logger.LogInformation($"⏳ Reintentando en {RETRY_DELAY_SECONDS} segundos...");
+                    Thread.Sleep(TimeSpan.FromSeconds(RETRY_DELAY_SECONDS));
+                    attempt++;
+                }
+            }
         }
 
-        public Task StartConsumingAsync(CancellationToken cancellationToken)
+        public async Task StartConsumingAsync(CancellationToken cancellationToken)
         {
+            // Inicializar conexión con reintentos
+            InitializeRabbitMQ();
+
             if (_channel == null)
             {
-                throw new InvalidOperationException("RabbitMQ channel no inicializado");
+                throw new InvalidOperationException("Channel no inicializado");
             }
 
             var consumer = new EventingBasicConsumer(_channel);
-            
+
             consumer.Received += async (model, ea) =>
             {
                 try
                 {
                     var body = ea.Body.ToArray();
-                    var message = Encoding.UTF8.GetString(body);
-                    
+                    var message = System.Text.Encoding.UTF8.GetString(body);
+
                     _logger.LogInformation($"📩 Mensaje recibido: {message}");
 
-                    await ProcessMessageAsync(message);
+                    using (var scope = _serviceProvider.CreateScope())
+                    {
+                        var emailService = scope.ServiceProvider.GetRequiredService<IEmailService>();
+                        await ProcessMessageAsync(message, emailService);
+                    }
 
                     _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                    _logger.LogDebug("✅ Mensaje procesado y confirmado");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "❌ Error procesando mensaje");
-                    _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
+                    _logger.LogError($"❌ Error procesando mensaje: {ex.Message}");
+                    _channel?.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
                 }
             };
 
@@ -88,17 +125,23 @@ namespace NotificationDelivery.Services
                 consumer: consumer
             );
 
-            _logger.LogInformation($"👂 Escuchando mensajes en cola: {_settings.QueueName}");
+            _logger.LogInformation("✅ Consumidor iniciado correctamente");
 
-            return Task.CompletedTask;
+            // Mantener vivo hasta que se cancele
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            }
+            catch (TaskCanceledException)
+            {
+                _logger.LogInformation("⚠️ Consumo cancelado");
+            }
         }
 
-        private async Task ProcessMessageAsync(string message)
+        private async Task ProcessMessageAsync(string message, IEmailService emailService)
         {
-            using var scope = _serviceProvider.CreateScope();
-            var emailService = scope.ServiceProvider.GetRequiredService<IEmailService>();
-
             var json = JObject.Parse(message);
+
             var type = json["type"]?.ToString()?.ToLower();
             var email = json["email"]?.ToString();
             var userName = json["userName"]?.ToString() ?? "Usuario";
@@ -140,9 +183,16 @@ namespace NotificationDelivery.Services
 
         public void Dispose()
         {
-            _channel?.Close();
-            _connection?.Close();
-            _logger.LogInformation("👋 Conexión RabbitMQ cerrada");
+            try
+            {
+                _channel?.Close();
+                _connection?.Close();
+                _logger.LogInformation("👋 Conexión RabbitMQ cerrada");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error cerrando conexión: {ex.Message}");
+            }
         }
     }
 }

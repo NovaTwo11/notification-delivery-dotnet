@@ -1,46 +1,80 @@
+// Jenkinsfile para notification-delivery-dotnet
+
 pipeline {
-    agent {
-        // Usamos la imagen SDK de .NET 8.0
-        docker {
-            image 'mcr.microsoft.com/dotnet/sdk:8.0'
-        }
+    // Usamos 'agent any' porque tu Jenkins ya tiene acceso al 
+    // socket de Docker del host (según tu docker-compose.yml)
+    agent any 
+
+    environment {
+        // Nombre de la imagen que construiremos
+        IMAGE_NAME = 'notification-delivery'
+        
+        // Tag (usamos el número de build de Jenkins)
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        
+        // Contenedor SDK para usar en la etapa de pruebas
+        DOTNET_SDK_IMAGE = 'mcr.microsoft.com/dotnet/sdk:8.0'
     }
+
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
+                checkout scm // Clona tu código
             }
         }
-        stage('Restore') {
-            steps {
-                sh 'dotnet restore'
-            }
-        }
-        stage('Build') {
-            steps {
-                sh 'dotnet build --no-restore -c Release'
-            }
-        }
-        stage('Test') {
-            // Asumiendo que tienes un proyecto de Test (si no, omite este stage)
-            steps {
-                echo 'Skipping tests...'
-                // sh 'dotnet test --no-build -c Release'
-            }
-        }
-        stage('Build Docker Image') {
+
+        stage('Pruebas Unitarias (Tests)') {
             steps {
                 script {
-                    def appImage = docker.build("notification-delivery:${env.BUILD_NUMBER}")
+                    // Esta es la forma limpia:
+                    // Ejecutamos las pruebas DENTRO de un contenedor SDK temporal.
+                    // No necesitamos 'dotnet' instalado en el agente de Jenkins.
+                    docker.image(DOTNET_SDK_IMAGE).inside {
+                        // El comando 'inside' monta el workspace actual
+                        sh 'dotnet restore'
+                        // Si tuvieras un proyecto de pruebas, lo correrías aquí:
+                        // sh 'dotnet test --no-restore --logger "trx;LogFileName=testresults.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover'
+                        echo 'Saltando pruebas (puedes configurar tu proyecto de tests aquí)...'
+                    }
                 }
             }
         }
+
+        stage('Construir Imagen Docker') {
+            steps {
+                script {
+                    // Le decimos a Jenkins que construya el Dockerfile 
+                    // que está en el directorio actual ('.')
+                    // El Dockerfile Multi-stage se encargará de compilar, publicar Y crear la imagen final.
+                    def appImage = docker.build("${IMAGE_NAME}:${IMAGE_TAG}", '.')
+                }
+            }
+        }
+
+        stage('Push a Registry (Opcional)') {
+            // Esta etapa solo se ejecuta si el build es en la rama 'main' o 'master'
+            when { branch 'main' }
+            
+            steps {
+                echo "Haciendo 'push' de ${IMAGE_NAME}:${IMAGE_TAG}..."
+                // Aquí necesitarías tus credenciales (ej. 'dockerhub-credentials')
+                // guardadas en Jenkins
+                //
+                // docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-credentials') {
+                //    docker.image(IMAGE_NAME).push(IMAGE_TAG)
+                // }
+                
+                echo "Simulación de push (configura tu registry aquí)..."
+            }
+        }
     }
+
     post {
+        // Se ejecuta siempre, al final del pipeline
         always {
-            cleanWs()
-            // Recoger reportes de tests (si se generan)
-            // junit '**/TestResults/*.xml'
+            echo 'Pipeline finalizado.'
+            // Opcional: Limpiar la imagen construida si no se hizo push
+            // sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG}"
         }
     }
 }
